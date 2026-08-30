@@ -18,12 +18,8 @@ async function apiPost(path: string, body: object): Promise<unknown> {
   return data;
 }
 
-export async function register(email: string, password: string): Promise<AuthResponse> {
-  return apiPost('/api/auth/register', { email, password }) as Promise<AuthResponse>;
-}
-
-export async function login(email: string, password: string): Promise<AuthResponse> {
-  return apiPost('/api/auth/login', { email, password }) as Promise<AuthResponse>;
+export async function loginWithGoogle(credential: string): Promise<AuthResponse> {
+  return apiPost('/api/auth/google', { credential }) as Promise<AuthResponse>;
 }
 
 export async function fetchPrefs(token: string): Promise<Prefs | null> {

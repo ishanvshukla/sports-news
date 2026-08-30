@@ -1,42 +1,67 @@
-import { useState, type FormEvent } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { useAuth } from '../../contexts/AuthContext';
 
 interface Props {
   onClose(): void;
 }
 
-type Tab = 'login' | 'register';
+const GOOGLE_CLIENT_ID = import.meta.env.VITE_GOOGLE_CLIENT_ID as string | undefined;
 
 export default function AuthModal({ onClose }: Props) {
-  const { login, register } = useAuth();
-  const [tab, setTab] = useState<Tab>('login');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
+  const { loginWithGoogle } = useAuth();
+  const [error, setError] = useState(() =>
+    GOOGLE_CLIENT_ID ? '' : 'Google sign-in is not configured for this deployment.'
+  );
   const [loading, setLoading] = useState(false);
+  const buttonRef = useRef<HTMLDivElement>(null);
 
-  function switchTab(t: Tab) {
-    setTab(t);
-    setError('');
-  }
+  useEffect(() => {
+    if (!GOOGLE_CLIENT_ID) return;
 
-  async function handleSubmit(e: FormEvent) {
-    e.preventDefault();
-    setError('');
-    setLoading(true);
-    try {
-      if (tab === 'login') {
-        await login(email, password);
-      } else {
-        await register(email, password);
+    let cancelled = false;
+
+    async function handleCredential(response: { credential: string }) {
+      setError('');
+      setLoading(true);
+      try {
+        await loginWithGoogle(response.credential);
+        onClose();
+      } catch (err: unknown) {
+        if (!cancelled) setError(err instanceof Error ? err.message : 'Something went wrong');
+      } finally {
+        if (!cancelled) setLoading(false);
       }
-      onClose();
-    } catch (err: unknown) {
-      setError(err instanceof Error ? err.message : 'Something went wrong');
-    } finally {
-      setLoading(false);
     }
-  }
+
+    // The GIS script is loaded (deferred) from index.html; it's usually
+    // ready by the time this modal mounts, but poll briefly in case it
+    // hasn't finished loading yet.
+    let attempts = 0;
+    const tryRender = () => {
+      if (cancelled) return;
+      if (!window.google || !buttonRef.current) {
+        if (attempts++ < 50) setTimeout(tryRender, 100);
+        return;
+      }
+      window.google.accounts.id.initialize({
+        client_id: GOOGLE_CLIENT_ID,
+        callback: handleCredential,
+      });
+      window.google.accounts.id.renderButton(buttonRef.current, {
+        theme: 'filled_black',
+        size: 'large',
+        width: 280,
+        text: 'continue_with',
+        shape: 'pill',
+      });
+    };
+    tryRender();
+
+    return () => {
+      cancelled = true;
+    };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   return (
     <div
@@ -63,96 +88,24 @@ export default function AuthModal({ onClose }: Props) {
           </button>
         </div>
 
-        {/* Tabs */}
-        <div className="flex mt-5 border-b border-espn-border">
-          {(['login', 'register'] as Tab[]).map((t) => (
-            <button
-              key={t}
-              type="button"
-              onClick={() => switchTab(t)}
-              className={`flex-1 py-3 font-oswald uppercase tracking-wider text-sm transition-colors ${
-                tab === t
-                  ? 'text-gold border-b-2 border-gold'
-                  : 'text-gray-500 hover:text-gray-300'
-              }`}
-            >
-              {t === 'login' ? 'Sign In' : 'Create Account'}
-            </button>
-          ))}
+        <div className="px-6 pt-5 pb-2 text-center">
+          <p className="font-oswald uppercase tracking-wider text-sm text-gray-400">Sign in to sync your preferences</p>
         </div>
 
-        {/* Form */}
-        <form onSubmit={handleSubmit} className="px-6 py-6 flex flex-col gap-4">
-          <div className="flex flex-col gap-1.5">
-            <label className="font-oswald text-xs uppercase tracking-wider text-gray-500">
-              Email
-            </label>
-            <input
-              type="email"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              required
-              autoComplete="email"
-              placeholder="you@example.com"
-              className="bg-espn-dark border border-espn-border rounded-lg px-4 py-2.5 text-white text-sm font-inter placeholder:text-gray-700 focus:outline-none focus:border-gold transition-colors"
-            />
-          </div>
+        {/* Google sign-in */}
+        <div className="px-6 py-6 flex flex-col items-center gap-4">
+          <div ref={buttonRef} className={loading ? 'opacity-50 pointer-events-none' : undefined} />
 
-          <div className="flex flex-col gap-1.5">
-            <label className="font-oswald text-xs uppercase tracking-wider text-gray-500">
-              Password
-            </label>
-            <input
-              type="password"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              required
-              autoComplete={tab === 'login' ? 'current-password' : 'new-password'}
-              placeholder={tab === 'register' ? 'At least 8 characters' : '••••••••'}
-              className="bg-espn-dark border border-espn-border rounded-lg px-4 py-2.5 text-white text-sm font-inter placeholder:text-gray-700 focus:outline-none focus:border-gold transition-colors"
-            />
-          </div>
+          {loading && (
+            <p className="text-gray-500 text-xs font-inter">Signing in…</p>
+          )}
 
           {error && (
             <p className="text-red-400 text-xs font-inter text-center bg-red-400/10 rounded-lg py-2 px-3">
               {error}
             </p>
           )}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="mt-1 py-3 rounded-lg font-oswald uppercase tracking-widest text-sm bg-gold text-black hover:bg-gold-bright transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-          >
-            {loading ? 'Please wait…' : tab === 'login' ? 'Sign In' : 'Create Account'}
-          </button>
-
-          <p className="text-center text-xs text-gray-600 font-inter">
-            {tab === 'login' ? (
-              <>
-                Don&apos;t have an account?{' '}
-                <button
-                  type="button"
-                  onClick={() => switchTab('register')}
-                  className="text-gold hover:text-gold-bright transition-colors"
-                >
-                  Sign up
-                </button>
-              </>
-            ) : (
-              <>
-                Already have an account?{' '}
-                <button
-                  type="button"
-                  onClick={() => switchTab('login')}
-                  className="text-gold hover:text-gold-bright transition-colors"
-                >
-                  Sign in
-                </button>
-              </>
-            )}
-          </p>
-        </form>
+        </div>
       </div>
     </div>
   );

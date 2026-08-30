@@ -1,5 +1,4 @@
 import hashlib
-import hmac
 import json
 import os
 import secrets
@@ -39,6 +38,18 @@ if not _jwt_secret:
 JWT_SECRET = _jwt_secret
 JWT_ALG = "HS256"
 JWT_EXPIRE_DAYS = 30
+
+# Google Sign-In: the frontend uses Google Identity Services to get an ID
+# token, which we verify here against Google's public keys before minting
+# our own session JWT (above). GOOGLE_CLIENT_ID must match the OAuth client
+# id configured on the frontend (VITE_GOOGLE_CLIENT_ID) — Google embeds the
+# frontend's client id as the token's audience, so a mismatch here rejects
+# every sign-in.
+GOOGLE_CLIENT_ID = os.environ.get("GOOGLE_CLIENT_ID", "")
+if not GOOGLE_CLIENT_ID:
+    print("WARNING: GOOGLE_CLIENT_ID not set — Google sign-in will reject all tokens. Add GOOGLE_CLIENT_ID to .env")
+GOOGLE_JWKS_URL = "https://www.googleapis.com/oauth2/v3/certs"
+_google_jwks_client = jwt.PyJWKClient(GOOGLE_JWKS_URL)
 
 SPORT_QUERIES: dict[str, str] = {
     "tennis": 'tennis OR ATP OR WTA OR Wimbledon OR "US Open" OR "French Open" OR "Australian Open"',
@@ -241,24 +252,7 @@ async def _redis_pipeline(commands: list[list]) -> list:
     return resp.json()
 
 
-# ── Password hashing (PBKDF2-SHA256, 260k iterations) ────────────────────────
-
-def hash_password(password: str) -> str:
-    salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
-    return f"{salt}${dk.hex()}"
-
-
-def verify_password(password: str, stored: str) -> bool:
-    try:
-        salt, dk_hex = stored.split("$", 1)
-    except ValueError:
-        return False
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 260_000)
-    return hmac.compare_digest(dk.hex(), dk_hex)
-
-
-# ── JWT ───────────────────────────────────────────────────────────────────────
+# ── JWT (our own session tokens, issued after Google verification) ──────────
 
 def create_token(user_id: int, email: str) -> str:
     payload = {
@@ -283,10 +277,34 @@ def current_user(request: Request) -> dict | None:
     return decode_token(auth[7:])
 
 
+def verify_google_id_token(id_token: str) -> dict | None:
+    """Verify a Google Identity Services ID token and return its claims.
+
+    Signature is checked against Google's published JWKS (fetched once and
+    cached by PyJWKClient, which also handles key rotation), and we pin the
+    audience to our own OAuth client id so a token minted for someone else's
+    app can't be replayed here.
+    """
+    try:
+        signing_key = _google_jwks_client.get_signing_key_from_jwt(id_token)
+        claims = jwt.decode(
+            id_token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=GOOGLE_CLIENT_ID,
+            issuer=["https://accounts.google.com", "accounts.google.com"],
+        )
+    except jwt.PyJWTError:
+        return None
+    if not claims.get("email_verified"):
+        return None
+    return claims
+
+
 # ── Auth: users in Redis ─────────────────────────────────────────────────────
 # user:email:{email} -> user id, claimed with SET NX so two concurrent
-# registrations for the same email can't both succeed. user:{id} -> JSON blob
-# {email, password_hash, created_at}.
+# first-time sign-ins for the same email can't both succeed. user:{id} ->
+# JSON blob {email, google_sub, created_at}.
 
 USER_ID_SEQ_KEY = "user_id_seq"
 
@@ -303,7 +321,7 @@ async def _get_user_by_email(email: str) -> dict | None:
     return user
 
 
-async def _create_user(email: str, password_hash: str) -> int | None:
+async def _create_user(email: str, google_sub: str) -> int | None:
     user_id = await _redis("INCR", USER_ID_SEQ_KEY)
     claimed = await _redis("SET", f"user:email:{email}", str(user_id), "NX")
     if not claimed:
@@ -313,60 +331,48 @@ async def _create_user(email: str, password_hash: str) -> int | None:
         f"user:{user_id}",
         json.dumps({
             "email": email,
-            "password_hash": password_hash,
+            "google_sub": google_sub,
             "created_at": datetime.now(timezone.utc).isoformat(),
         }),
     )
     return user_id
 
 
-async def register(request: Request) -> JSONResponse:
+async def google_auth(request: Request) -> JSONResponse:
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
 
-    email = (body.get("email") or "").strip().lower()
-    password = body.get("password") or ""
+    id_token = body.get("credential") or ""
+    if not id_token:
+        return JSONResponse({"error": "Missing credential"}, status_code=400)
 
-    if not email or not password:
-        return JSONResponse({"error": "Email and password required"}, status_code=400)
-    if len(password) < 8:
-        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
-    if len(password) > 1024:
-        return JSONResponse({"error": "Password too long"}, status_code=400)
+    claims = verify_google_id_token(id_token)
+    if claims is None:
+        return JSONResponse({"error": "Invalid Google credential"}, status_code=401)
 
-    pw_hash = hash_password(password)
+    email = (claims.get("email") or "").strip().lower()
+    google_sub = claims["sub"]
+    if not email:
+        return JSONResponse({"error": "Invalid Google credential"}, status_code=401)
 
     try:
-        user_id = await _create_user(email, pw_hash)
+        user = await _get_user_by_email(email)
+        if user is None:
+            user_id = await _create_user(email, google_sub)
+            if user_id is None:
+                # Lost a race with a concurrent first sign-in for this email — re-fetch.
+                user = await _get_user_by_email(email)
+        else:
+            user_id = user["id"]
     except httpx.HTTPError:
         return JSONResponse({"error": "Datastore unreachable"}, status_code=502)
 
     if user_id is None:
-        return JSONResponse({"error": "Email already registered"}, status_code=409)
-
-    return JSONResponse({"token": create_token(user_id, email), "email": email})
-
-
-async def login(request: Request) -> JSONResponse:
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON"}, status_code=400)
-
-    email = (body.get("email") or "").strip().lower()
-    password = body.get("password") or ""
-
-    try:
-        user = await _get_user_by_email(email)
-    except httpx.HTTPError:
         return JSONResponse({"error": "Datastore unreachable"}, status_code=502)
 
-    if not user or not verify_password(password, user["password_hash"]):
-        return JSONResponse({"error": "Invalid email or password"}, status_code=401)
-
-    return JSONResponse({"token": create_token(user["id"], email), "email": email})
+    return JSONResponse({"token": create_token(user_id, email), "email": email})
 
 
 # ── Prefs routes ──────────────────────────────────────────────────────────────
@@ -750,8 +756,7 @@ async def lifespan(app: Starlette):
 
 
 routes = [
-    Route("/api/auth/register", register, methods=["POST"]),
-    Route("/api/auth/login", login, methods=["POST"]),
+    Route("/api/auth/google", google_auth, methods=["POST"]),
     Route("/api/prefs", prefs, methods=["GET", "PUT"]),
     Route("/api/visitor", record_visit, methods=["POST"]),
     Route("/api/news/top", top_stories),

@@ -14,7 +14,7 @@ Note: the app is hosted on Render's free tier, so it spins down after periods of
 - **7 sports** — Tennis, NBA Basketball, Soccer, NFL Football, Formula 1, College Football, UFC/MMA
 - **Team filtering** — follow specific clubs, players, or programs (e.g. Arsenal, Knicks, Verstappen)
 - **Up Next widget** — sidebar showing the next scheduled game for every team and player you follow, powered by TheSportsDB (no NewsAPI quota used)
-- **Accounts** — register/log in to sync preferences across devices; guest mode falls back to `localStorage`
+- **Accounts** — sign in with Google to sync preferences across devices; guest mode falls back to `localStorage`
 - **Server-side caching** — Redis-backed cache (3h TTL for news, hours-to-days for fixtures) keeps day-to-day browsing well under the NewsAPI free-tier quota, with stale-cache fallback if the API is down or rate-limited
 - **Backend proxy** — API key stays server-side; the browser never sees it
 - **Edit anytime** — "Edit" button in the header reopens the full onboarding flow
@@ -24,7 +24,7 @@ Note: the app is hosted on Render's free tier, so it spins down after periods of
 | Layer | Tech |
 |---|---|
 | Frontend | React 19, TypeScript, Vite, Tailwind CSS, TanStack Query, Framer Motion, Axios |
-| Backend | Python 3.12, uvicorn (ASGI), httpx, PyJWT (HS256), PBKDF2-SHA256 |
+| Backend | Python 3.12, uvicorn (ASGI), httpx, Google Identity Services (Sign in with Google), PyJWT (RS256 to verify Google, HS256 for our own session tokens) |
 | Persistence | Upstash Redis (REST API) — the sole datastore: users, prefs, news/fixtures cache, and visitor counter, so nothing resets on a Render spin-down |
 | Data sources | [NewsAPI](https://newsapi.org) (articles), [TheSportsDB](https://www.thesportsdb.com) (fixtures, free/keyless) |
 | Deployment | Docker (multi-stage build), Render (free tier, single web service) |
@@ -39,14 +39,14 @@ Browser ── GET /        → static React app
                             fixtures (TheSportsDB, cached in Redis) · visitor count (Redis)
 ```
 
-- **Auth & prefs** — registration/login issue a JWT (stored client-side); a logged-in user's sport/team selections are saved server-side, while guests fall back to `localStorage` so the app still works without an account.
+- **Auth & prefs** — the frontend uses Google Identity Services to get a Google ID token; the backend verifies it against Google's public keys (audience-checked against `GOOGLE_CLIENT_ID`) and, on first sign-in, creates a user keyed by the verified email, then issues its own short-lived-session JWT (stored client-side) for subsequent requests. A logged-in user's sport/team selections are saved server-side, while guests fall back to `localStorage` so the app still works without an account.
 - **News & fixtures** — the backend proxies every third-party call, so API keys never reach the browser. Each response is cached in Redis, without a Redis-native TTL — freshness is checked in-app, so a stale response is never simply evicted; it's served as a fallback if an upstream call fails or rate-limits, rather than showing an error.
 - **Why Redis for everything** — Render's free tier has no persistent disk, so anything kept in a local file gets wiped on every redeploy. Redis is external and stateless from the app's perspective, so a redeploy or spin-down never loses users, prefs, or cache — this used to only cover the visitor counter, with the rest on a local SQLite file, until that same wipe-on-redeploy problem started hitting news caching too (see Issues below).
 - **Build & deploy** — a multi-stage Docker build compiles the frontend to static assets, then copies them into a slim Python image alongside the backend, so the shipped container has no Node runtime. In local dev, Vite proxies `/api/*` to the backend so both run side by side without CORS configuration.
 
 ## Running locally
 
-Requires a free [Upstash](https://upstash.com) Redis database (500K commands/month free tier — more than enough for local dev) — Redis is the only datastore, so the backend won't start without it.
+Requires a free [Upstash](https://upstash.com) Redis database (500K commands/month free tier — more than enough for local dev) — Redis is the only datastore, so the backend won't start without it. Sign-in also requires a Google OAuth client id — create one at the [Google Cloud Console credentials page](https://console.cloud.google.com/apis/credentials) (OAuth client ID → Web application) with `http://localhost:5173` added as an authorized JavaScript origin.
 
 ```bash
 # backend
@@ -56,6 +56,8 @@ cat > .env <<EOF
 NEWS_API_KEY=your_key_here
 UPSTASH_REDIS_REST_URL=your_upstash_rest_url
 UPSTASH_REDIS_REST_TOKEN=your_upstash_rest_token
+GOOGLE_CLIENT_ID=your_google_oauth_client_id
+VITE_GOOGLE_CLIENT_ID=your_google_oauth_client_id
 EOF
 uvicorn server:app --reload --port 8000
 
@@ -63,6 +65,8 @@ uvicorn server:app --reload --port 8000
 npm install
 npm run dev
 ```
+
+Both env vars hold the same client id — `GOOGLE_CLIENT_ID` is what the backend checks token audiences against, `VITE_GOOGLE_CLIENT_ID` is what the frontend embeds to request tokens. In production, Vite inlines `VITE_GOOGLE_CLIENT_ID` at Docker build time, not at container runtime, so it has to be supplied as a Docker build argument (see `Dockerfile`) rather than a plain Render environment variable — double-check this in Render's dashboard when deploying, since a value that only reaches the running container and never reaches the build step would silently ship a frontend with no client id (the same class of "credential set in the wrong place" mistake as the Redis deploy failure below).
 
 ## Issues run into (and fixes)
 

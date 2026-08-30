@@ -6,6 +6,12 @@ RUN npm ci
 COPY index.html vite.config.ts tsconfig*.json tailwind.config.js postcss.config.js ./
 COPY public ./public
 COPY src ./src
+# Vite inlines VITE_* vars into the bundle at build time, not at container
+# runtime, so this has to arrive as a Docker build arg (Render: service
+# Settings -> Build -> Docker Build Args) rather than a regular env var —
+# a plain runtime envVar here would silently ship a build with no client id.
+ARG VITE_GOOGLE_CLIENT_ID
+ENV VITE_GOOGLE_CLIENT_ID=$VITE_GOOGLE_CLIENT_ID
 RUN npm run build
 
 # Stage 2: run the backend, serving the built frontend as static files

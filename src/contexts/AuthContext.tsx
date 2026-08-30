@@ -1,7 +1,6 @@
 import { createContext, useContext, useState, useEffect, useRef, type ReactNode } from 'react';
 import {
-  login as apiLogin,
-  register as apiRegister,
+  loginWithGoogle as apiLoginWithGoogle,
   fetchPrefs,
   savePrefsApi,
 } from '../services/authApi';
@@ -16,8 +15,7 @@ interface AuthContextValue {
   serverPrefs: Prefs | null;
   isLoggedIn: boolean;
   prefsLoading: boolean;
-  login(email: string, password: string): Promise<void>;
-  register(email: string, password: string): Promise<void>;
+  loginWithGoogle(credential: string): Promise<void>;
   logout(): void;
   syncPrefs(prefs: Prefs): Promise<void>;
 }
@@ -59,17 +57,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     setEmail(e);
   }
 
-  async function login(emailVal: string, password: string): Promise<void> {
-    const res = await apiLogin(emailVal, password);
+  async function loginWithGoogle(credential: string): Promise<void> {
+    const res = await apiLoginWithGoogle(credential);
     persistAuth(res.token, res.email);
     const p = await fetchPrefs(res.token);
     setServerPrefs(p);
-  }
-
-  async function register(emailVal: string, password: string): Promise<void> {
-    const res = await apiRegister(emailVal, password);
-    persistAuth(res.token, res.email);
-    setServerPrefs(null);
   }
 
   function logout(): void {
@@ -90,8 +82,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         serverPrefs,
         isLoggedIn: !!token,
         prefsLoading,
-        login,
-        register,
+        loginWithGoogle,
         logout,
         syncPrefs,
       }}
